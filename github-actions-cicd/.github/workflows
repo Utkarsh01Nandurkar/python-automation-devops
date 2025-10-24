@@ -1,0 +1,130 @@
+name: CI / CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ${{ secrets.IMAGE_NAME }}    # e.g. utk-app-repo
+  AWS_REGION: ${{ secrets.AWS_REGION }}    # e.g. us-east-1
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }} # e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com
+  TF_WORKING_DIR: terraform-aws-infra      # optional path if terraform in repo
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.create_tag.outputs.IMAGE_TAG }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r app/requirements.txt
+
+      - name: Run tests
+        run: |
+          pytest -q
+
+      - name: Create image tag
+        id: create_tag
+        run: |
+          # semantic tag: branch-commitshort or timestamp on main
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            TAG="v$(date +'%Y%m%d%H%M%S')"
+          else
+            SHORT=$(echo "${GITHUB_SHA}" | cut -c1-7)
+            BRANCH=$(echo "${GITHUB_REF#refs/heads/}" | tr '/' '-')
+            TAG="${BRANCH}-${SHORT}"
+          fi
+          echo "IMAGE_TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "Created TAG=$TAG"
+
+  build_and_push:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr_login
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Extract ECR registry and repo
+        run: |
+          echo "ECR_REGISTRY=${{ env.ECR_REGISTRY }}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${{ needs.test.outputs.image_tag }}" >> $GITHUB_ENV
+
+      - name: Build and push Docker image to ECR
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }},${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Output pushed image
+        run: echo "Pushed: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+
+  terraform_plan:
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        run: terraform plan -var="node_group_desired_capacity=1" -out=tfplan
+
+      # optional: you can apply automatically (careful about costs)
+      # - name: Terraform apply
+      #   run: terraform apply -auto-approve tfplan
